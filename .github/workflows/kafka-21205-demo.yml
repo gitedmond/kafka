@@ -1,0 +1,41 @@
+name: KAFKA-21205 Markdown demonstration
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: kafka-21205-demo-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  demonstrate:
+    if: github.repository == 'gitedmond/kafka' && github.head_ref == 'demo/kafka-21205-markdown' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install fixed formatter dependency
+        run: python -m pip install markdown-it-py==4.2.0
+      - name: Demonstrate original, restore input, and verify fix twice
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python .demo/kafka-21205/run-demo.py
+      - name: Upload exact inputs, outputs, diff, and CLI logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kafka-21205-markdown-evidence
+          path: demo-results/
