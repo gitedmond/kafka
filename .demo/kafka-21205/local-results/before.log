@@ -1,0 +1,55 @@
+PR format looks good!
+Read env PR_NUMBER: 1
+Read env GITHUB_ACTIONS: true
+Commit will look like:
+
+<pre>
+KAFKA-21205 Markdown demonstration (#1)
+
+## KAFKA-21205 live Markdown demonstration
+
+This fork-only PR demonstrates the original formatter and the fix in
+[apache/kafka#23691](https://github.com/apache/kafka/pull/23691).
+
+### Indented list
+
+Example list:  - first item  - second item
+
+### Code block with a blank line
+
+```python
+def example():
+    first = 1
+
+    second = 2     return first + second
+
+```
+
+### Long indented code line
+
+```python
+def long_example():
+    result = call_with_many_arguments(first_argument, second_argument,
+third_argument, fourth_argument, fifth_argument)
+    return result
+```
+
+### Verification
+
+The demonstration restores this exact input between the original and
+fixed runs. The fixed formatter must preserve the full description byte
+for byte, and a second fixed run must leave it unchanged. See the
+workflow and the files in `.demo/kafka-21205/` for reproducible evidence
+and source versions.
+
+</pre>
+
+Validation results:
+* ✅ Title is not truncated
+* ✅ Title is not too short
+* ✅ Title is not too long
+* ✅ Title has expected KAFKA/MINOR/HOTFIX
+* ✅ Body is not empty
+* ✅ PR template text not present
+* ✅ PR template text not present
+No validation errors, PR format looks good!

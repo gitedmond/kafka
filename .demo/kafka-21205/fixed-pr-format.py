@@ -1,0 +1,250 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections import defaultdict
+from io import BytesIO
+import json
+import logging
+import os
+import re
+import subprocess
+import shlex
+import sys
+import tempfile
+import textwrap
+from typing import Dict, Optional, TextIO
+
+from markdown_it import MarkdownIt
+
+logger = logging.getLogger("pr-format")
+logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler(sys.stderr)
+handler.setLevel(logging.DEBUG)
+logger.addHandler(handler)
+
+ok = "✅"
+err = "❌"
+
+
+def get_env(key: str, fn = str) -> Optional:
+    value = os.getenv(key)
+    if value is None:
+        logger.debug(f"Could not find env {key}")
+        return None
+    else:
+        logger.debug(f"Read env {key}: {value}")
+        return fn(value)
+
+
+def has_approval(reviews) -> bool:
+    approved = False
+    for review in reviews:
+        if review.get("authorAssociation") not in ("MEMBER", "OWNER"):
+            continue
+        if review.get("state") == "APPROVED":
+            approved = True
+    return approved
+
+
+def write_commit(io: TextIO, title: str, body: str):
+    io.write(title.encode())
+    io.write(b"\n\n")
+    io.write(body.encode())
+    io.flush()
+
+
+def parse_trailers(title, body) -> Dict:
+    trailers = defaultdict(list)
+
+    with tempfile.NamedTemporaryFile() as fp:
+        write_commit(fp, title, body)
+        cmd = f"git interpret-trailers --trim-empty --parse {fp.name}"
+        p = subprocess.run(shlex.split(cmd), capture_output=True)
+        fp.close()
+
+    for line in p.stdout.decode().splitlines():
+        key, value = line.split(":", 1)
+        trailers[key].append(value.strip())
+
+    return trailers
+
+
+def format_body(body: str) -> str:
+    """
+    Wrap plain top-level prose, copying all other Markdown from the source.
+
+    Token line maps identify paragraphs without reserializing Markdown. In
+    particular, paragraphs inside lists and quotes and code containing blank
+    lines must retain their original indentation, whitespace and line breaks.
+    """
+    # Match CommonMark line endings; str.splitlines also splits Unicode
+    # separators, which would make the parser's source maps point at wrong lines.
+    lines = re.findall(r"[^\r\n]*(?:\r\n|\r|\n|$)", body)
+    if lines and lines[-1] == "":
+        lines.pop()
+    parser = MarkdownIt("commonmark").enable(["table", "strikethrough"])
+    tokens = parser.parse(body)
+    result = []
+    cursor = 0
+    for index, token in enumerate(tokens):
+        if token.type != "paragraph_open" or token.level != 0:
+            continue
+        start, end = token.map
+        source = lines[start:end]
+        reviewers = source[0].startswith("Reviewers:")
+        # Preserve inline Markdown and explicit hard breaks as well as blocks.
+        # Email autolinks in reviewer trailers can still be wrapped as prose.
+        def plain_inline(inline):
+            return all(
+                child.type in ("text", "softbreak") or (
+                    reviewers and child.type in ("link_open", "link_close")
+                    and child.markup == "autolink"
+                )
+                for child in inline.children
+            )
+
+        if not plain_inline(tokens[index + 1]):
+            continue
+        # Indentation can have meaning even in paragraphs. Reviewers trailers
+        # are the exception: git interpret-trailers needs indented continuations.
+        if not reviewers and any(line.startswith((" ", "\t")) for line in source):
+            continue
+        first_ending = re.search(r"(\r\n|\r|\n)$", source[0])
+        newline = first_ending.group() if first_ending else "\n"
+        last_ending = re.search(r"(\r\n|\r|\n)$", source[-1])
+        ending = last_ending.group() if last_ending else ""
+        wrapped = textwrap.fill(
+            "".join(source), subsequent_indent=" " if reviewers else "",
+            width=72, break_long_words=False, break_on_hyphens=False,
+            replace_whitespace=True,
+        ).replace("\n", newline) + ending
+        # A newly wrapped line can start a Markdown block (e.g. '- item').
+        # Keep the source if wrapping would change the paragraph's structure.
+        environment = {}
+        wrapped_tokens = parser.parse(wrapped, environment)
+        if (
+            [t.type for t in wrapped_tokens] != ["paragraph_open", "inline", "paragraph_close"]
+            or environment.get("references")
+            or not plain_inline(wrapped_tokens[1])
+        ):
+            continue
+        result.extend(lines[cursor:start])
+        result.append(wrapped)
+        cursor = end
+    result.extend(lines[cursor:])
+    return "".join(result)
+
+
+if __name__ == "__main__":
+    """
+    This script performs some basic linting of our PR titles and body. The PR number is read from the PR_NUMBER
+    environment variable. Since this script expects to run on a GHA runner, it expects the "gh" tool to be installed.
+    
+    The STDOUT from this script is used as the status check message. It should not be too long. Use the logger for
+    any necessary logging.
+    
+    Title checks:
+    * Not too short (at least 15 characters)
+    * Not too long (at most 120 characters)
+    * Not truncated (ending with ...)
+    * Starts with "KAFKA-", "MINOR", or "HOTFIX"
+    
+    Body checks:
+    * Is not empty
+    * Has "Reviewers:" trailer if the PR is approved
+    """
+
+    pr_number = get_env("PR_NUMBER")
+    cmd = f"gh pr view {pr_number} --json 'title,body,reviews'"
+    p = subprocess.run(shlex.split(cmd), capture_output=True)
+    if p.returncode != 0:
+        logger.error(f"GitHub CLI failed with exit code {p.returncode}.\nSTDOUT: {p.stdout.decode()}\nSTDERR:{p.stderr.decode()}")
+        exit(1)
+
+    gh_json = json.loads(p.stdout)
+    title = gh_json["title"]
+    body = gh_json["body"]
+    reviews = gh_json["reviews"]
+
+    checks = [] # (bool (0=ok, 1=error), message)
+
+    def check(positive_assertion, ok_msg, err_msg):
+        if positive_assertion:
+            checks.append((0, f"{ok} {ok_msg}"))
+        else:
+            checks.append((1, f"{err} {err_msg}"))
+
+    # Check title
+    check(not title.endswith("..."), "Title is not truncated", "Title appears truncated (ends with ...)")
+    check(len(title) >= 15, "Title is not too short", "Title is too short (under 15 characters)")
+    check(len(title) <= 120, "Title is not too long", "Title is too long (over 120 characters)")
+    ok_prefix = title.startswith("KAFKA-") or title.startswith("MINOR") or title.startswith("HOTFIX")
+    check(ok_prefix, "Title has expected KAFKA/MINOR/HOTFIX", "Title is missing KAFKA-XXXXX or MINOR/HOTFIX prefix")
+
+    # Check body
+    check(len(body) != 0, "Body is not empty", "Body is empty")
+    check("Delete this text and replace" not in body, "PR template text not present", "PR template text should be removed")
+    check("Committer Checklist" not in body, "PR template text not present", "Old PR template text should be removed")
+
+    original_body = body
+    body = format_body(body)
+
+    if body == original_body:
+        logger.info(f"PR {pr_number} body is already formatted.")
+    elif get_env("GITHUB_ACTIONS"):
+        with tempfile.NamedTemporaryFile() as fp:
+            fp.write(body.encode())
+            fp.flush()
+            cmd = f"gh pr edit {pr_number} --body-file {fp.name}"
+            p = subprocess.run(shlex.split(cmd), capture_output=True)
+            fp.close()
+            if p.returncode != 0:
+                logger.error(f"Could not update PR {pr_number}. STDOUT: {p.stdout.decode()}")
+    else:
+        logger.info(f"Not reformatting {pr_number} since this is not running on GitHub Actions.")
+
+    # Check for Reviewers
+    approved = has_approval(reviews)
+    if approved:
+        trailers = parse_trailers(title, body)
+        reviewers_in_body = trailers.get("Reviewers", [])
+        check(len(reviewers_in_body) > 0, "Found 'Reviewers' in commit body", "Pull Request is approved, but no 'Reviewers' found in commit body")
+        if len(reviewers_in_body) > 0:
+            for reviewer_in_body in reviewers_in_body:
+                logger.debug(reviewer_in_body)
+
+    logger.debug("Commit will look like:\n")
+    logger.debug("<pre>")
+    io = BytesIO()
+    title += f" (#{pr_number})"
+    write_commit(io, title, body)
+    io.seek(0)
+    logger.debug(io.read().decode())
+    logger.debug("</pre>\n")
+
+    exit_code = 0
+    logger.debug("Validation results:")
+    for err, msg in checks:
+        logger.debug(f"* {msg}")
+
+    for err, msg in checks:
+        # Just output the first error for the status message. STDOUT becomes the status check message
+        if err:
+            print(msg)
+            exit(1)
+
+    logger.debug("No validation errors, PR format looks good!")
+    print("PR format looks good!")
+    exit(0)
